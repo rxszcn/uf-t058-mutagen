@@ -1,3 +1,15 @@
+.. _release-1.48.2:
+
+1.48.2 - unreleased
+-------------------
+
+* MP4: harden track selection in `MP4Info` -- only audio (``soun``) tracks
+  are inspected, the first audio track wins independently of video/audio
+  track order, pure video files keep the audio attributes at their zero
+  defaults instead of deriving numbers from video sample entries, and
+  missing or truncated ``hdlr``/``mdhd`` atoms raise
+  `mutagen.mp4.MP4StreamInfoError` instead of leaking low level exceptions
+
 .. _release-1.48.1:
 
 1.48.1 - 2026-06-25

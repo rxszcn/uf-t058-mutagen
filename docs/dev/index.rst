@@ -15,3 +15,4 @@ Generate coverage data from the repository root with::
     :maxdepth: 2
 
     id3
+    mp4-stream-selection

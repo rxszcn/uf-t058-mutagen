@@ -9,7 +9,7 @@ import pytest
 from tests import TestCase, DATA_DIR, get_temp_copy
 from mutagen.mp4 import (MP4, MP4Tags, MP4Info, delete, MP4Cover,
                          MP4MetadataError, MP4FreeForm, error, AtomDataType,
-                         _item_sort_key, MP4StreamInfoError)
+                         _item_sort_key, MP4StreamInfoError, MP4NoTrackError)
 from mutagen.mp4._atom import Atom, Atoms, AtomError
 from mutagen.mp4._util import parse_full_atom
 from mutagen.mp4._as_entry import AudioSampleEntry, ASEntryError
@@ -167,6 +167,260 @@ class TMP4Info(TestCase):
         atoms = Atoms(fileobj)
         with self.assertRaises(MP4StreamInfoError):
             MP4Info(atoms, fileobj)
+
+
+def _hdlr(handler_type):
+    # version/flags + pre_defined + handler_type + reserved name/mini-fields
+    return Atom.render(
+        b"hdlr", b"\x00" * 8 + handler_type + b"\x00" * 12)
+
+
+def _mdhd(timescale=44100, duration=44100):
+    return Atom.render(b"mdhd", (
+        b"\x00\x00\x00\x00" + b"\x00" * 8 +
+        struct.pack(">II", timescale, duration) + b"\x00\x00"))
+
+
+def _mvhd(timescale=1000, duration=1000):
+    return Atom.render(b"mvhd", (
+        b"\x00\x00\x00\x00" + b"\x00" * 8 +
+        struct.pack(">II", timescale, duration) + b"\x00" * 80))
+
+
+def _audio_stsd(channels, sample_rate, codec=b"mp4a"):
+    # AudioSampleEntry (ISO/IEC 14496-12, 8.5.2): reserved 6+2+8 bytes,
+    # channelcount(2), samplesize(2), pre_defined+reserved(4),
+    # samplerate as 16.16 fixed point (4)
+    entry = (
+        b"\x00" * 16 +
+        struct.pack(">H", channels) +
+        struct.pack(">H", 16) +
+        b"\x00" * 4 +
+        struct.pack(">I", sample_rate << 16) +
+        Atom.render(b"free", b""))
+    entry = Atom.render(codec, entry)
+    return Atom.render(
+        b"stsd", b"\x00\x00\x00\x00" + struct.pack(">I", 1) + entry)
+
+
+def _video_stsd(width=1920, height=1080, codec=b"avc1"):
+    # VisualSampleEntry: reserved 6+2+16 bytes, then width(2)/height(2);
+    # laid out so width/height would read as bogus audio numbers if the
+    # track were ever misselected as an audio track.
+    entry = (
+        b"\x00" * 24 +
+        struct.pack(">HH", width, height) +
+        b"\x00" * 42 +
+        Atom.render(b"avcC", b"\x00"))
+    entry = Atom.render(codec, entry)
+    return Atom.render(
+        b"stsd", b"\x00\x00\x00\x00" + struct.pack(">I", 1) + entry)
+
+
+def _audio_trak(channels, sample_rate):
+    stbl = Atom.render(b"stbl", _audio_stsd(channels, sample_rate))
+    minf = Atom.render(b"minf", stbl)
+    mdia = Atom.render(b"mdia", _mdhd() + _hdlr(b"soun") + minf)
+    return Atom.render(b"trak", mdia)
+
+
+def _video_trak(width=1920, height=1080):
+    stbl = Atom.render(b"stbl", _video_stsd(width, height))
+    minf = Atom.render(b"minf", stbl)
+    mdia = Atom.render(
+        b"mdia",
+        _mdhd(timescale=24000, duration=24000) + _hdlr(b"vide") + minf)
+    return Atom.render(b"trak", mdia)
+
+
+def _build_info(*traks, mvhd=_mvhd()):
+    moov = Atom.render(b"moov", mvhd + b"".join(traks))
+    fileobj = BytesIO(moov)
+    return MP4Info(Atoms(fileobj), fileobj)
+
+
+class TMP4StreamSelection(TestCase):
+    """Contract for stream selection across all container shapes.
+
+    * mixed containers expose audio-track attributes regardless of track
+      order
+    * pure video files never fabricate audio numbers
+    * with multiple audio tracks the first one is selected
+    * malformed track blocks surface as MP4StreamInfoError, never as raw
+      low level exceptions
+    """
+
+    # -- the five container shapes -------------------------------------
+
+    def test_pure_video_reports_no_audio_numbers(self):
+        info = _build_info(_video_trak())
+        # video dimensions must never leak into the audio attributes
+        self.assertEqual(info.channels, 0)
+        self.assertEqual(info.sample_rate, 0)
+        self.assertEqual(info.bits_per_sample, 0)
+        self.assertEqual(info.bitrate, 0)
+        self.assertEqual(info.codec, u"")
+        # container duration is still available via mvhd
+        self.assertEqual(info.length, 1.0)
+
+    def test_video_then_audio_selects_audio(self):
+        info = _build_info(_video_trak(), _audio_trak(2, 48000))
+        self.assertEqual(info.channels, 2)
+        self.assertEqual(info.sample_rate, 48000)
+        self.assertEqual(info.bits_per_sample, 16)
+        self.assertEqual(info.codec, u"mp4a")
+
+    def test_audio_then_video_selects_audio(self):
+        info = _build_info(_audio_trak(2, 48000), _video_trak())
+        self.assertEqual(info.channels, 2)
+        self.assertEqual(info.sample_rate, 48000)
+        self.assertEqual(info.bits_per_sample, 16)
+        self.assertEqual(info.codec, u"mp4a")
+
+    def test_order_independence(self):
+        video_first = _build_info(_video_trak(), _audio_trak(2, 48000))
+        video_last = _build_info(_audio_trak(2, 48000), _video_trak())
+        self.assertEqual(video_first.channels, video_last.channels)
+        self.assertEqual(video_first.sample_rate, video_last.sample_rate)
+        self.assertEqual(video_first.bits_per_sample,
+                         video_last.bits_per_sample)
+        self.assertEqual(video_first.codec, video_last.codec)
+
+    def test_dual_audio_selects_first_track(self):
+        info = _build_info(
+            _audio_trak(1, 16000), _audio_trak(2, 48000))
+        self.assertEqual(info.channels, 1)
+        self.assertEqual(info.sample_rate, 16000)
+
+    def test_dual_audio_first_track_is_order_stable(self):
+        # swapping the physical order swaps the selected values, but it is
+        # always the first audio track that wins
+        swapped = _build_info(
+            _audio_trak(2, 48000), _audio_trak(1, 16000))
+        self.assertEqual(swapped.channels, 2)
+        self.assertEqual(swapped.sample_rate, 48000)
+
+    def test_audio_only_keeps_audio_attributes(self):
+        info = _build_info(_audio_trak(2, 44100))
+        self.assertEqual(info.channels, 2)
+        self.assertEqual(info.sample_rate, 44100)
+        self.assertEqual(info.bits_per_sample, 16)
+        self.assertEqual(info.codec, u"mp4a")
+
+    # -- no audio track defaults ---------------------------------------
+
+    def test_no_tracks_without_mvhd_raises_no_track(self):
+        fileobj = BytesIO(Atom.render(b"moov", b""))
+        with self.assertRaises(MP4NoTrackError):
+            MP4Info(Atoms(fileobj), fileobj)
+
+    def test_no_audio_track_with_mvhd_uses_defaults(self):
+        # pure-video-style container carrying only an mvhd: audio fields
+        # stay at their documented zero defaults, length comes from mvhd
+        fileobj = BytesIO(Atom.render(b"moov", _mvhd()))
+        info = MP4Info(Atoms(fileobj), fileobj)
+        self.assertEqual(info.bitrate, 0)
+        self.assertEqual(info.channels, 0)
+        self.assertEqual(info.sample_rate, 0)
+        self.assertEqual(info.bits_per_sample, 0)
+        self.assertEqual(info.codec, u"")
+        self.assertEqual(info.length, 1.0)
+
+    def test_high_level_mp4_swallows_no_track(self):
+        # MP4.load deliberately ignores MP4NoTrackError so opening a
+        # non-audio container still yields an object with default info
+        ftyp = Atom.render(b"ftyp", b"isom" + b"\x00" * 8)
+        fileobj = BytesIO(
+            ftyp + Atom.render(b"moov", _mvhd() + _video_trak()))
+        mp4 = MP4(fileobj)
+        self.assertEqual(mp4.info.channels, 0)
+        self.assertEqual(mp4.info.sample_rate, 0)
+        self.assertEqual(mp4.info.bitrate, 0)
+
+    # -- malformed stream blocks ---------------------------------------
+
+    def test_trak_without_hdlr_raises_stream_info_error(self):
+        bad_trak = Atom.render(b"trak", Atom.render(b"mdia", _mdhd()))
+        with self.assertRaises(MP4StreamInfoError):
+            _build_info(bad_trak)
+
+    def test_truncated_hdlr_raises_stream_info_error(self):
+        for payload in (b"", b"\x00" * 4, b"\x00" * 10, b"\x00" * 11):
+            bad_hdlr = Atom.render(b"hdlr", payload)
+            bad_trak = Atom.render(
+                b"trak", Atom.render(b"mdia", _mdhd() + bad_hdlr))
+            with self.assertRaises(MP4StreamInfoError):
+                _build_info(bad_trak)
+
+    def test_truncated_hdlr_does_not_silently_skip_audio(self):
+        # a valid audio track behind a truncated one must not hide the
+        # malformation: the error is explicit instead of order dependent
+        bad_hdlr = Atom.render(b"hdlr", b"\x00" * 4)
+        bad_trak = Atom.render(
+            b"trak", Atom.render(b"mdia", _mdhd() + bad_hdlr))
+        with self.assertRaises(MP4StreamInfoError):
+            _build_info(bad_trak, _audio_trak(2, 48000))
+
+    def test_sound_trak_without_mdhd_raises_stream_info_error(self):
+        bad_trak = Atom.render(
+            b"trak", Atom.render(b"mdia", _hdlr(b"soun")))
+        with self.assertRaises(MP4StreamInfoError):
+            _build_info(bad_trak)
+
+    def test_no_raw_keyerror_escapes(self):
+        # malformed structures must never leak container lookup errors
+        bad_trak = Atom.render(b"trak", Atom.render(b"mdia", _mdhd()))
+        try:
+            _build_info(bad_trak)
+        except MP4StreamInfoError:
+            pass
+        else:
+            self.fail("expected MP4StreamInfoError")
+
+    def test_unknown_handler_type_is_skipped(self):
+        # non-audio, non-video handlers behave like video tracks
+        trak = Atom.render(
+            b"trak",
+            Atom.render(
+                b"mdia",
+                _mdhd() + _hdlr(b"hint") +
+                Atom.render(b"minf", Atom.render(b"stbl", b""))))
+        info = _build_info(trak)
+        self.assertEqual(info.channels, 0)
+        self.assertEqual(info.sample_rate, 0)
+
+    def test_malformed_trak_after_video_still_raises(self):
+        bad_hdlr = Atom.render(b"hdlr", b"\x00" * 4)
+        bad_trak = Atom.render(
+            b"trak", Atom.render(b"mdia", _mdhd() + bad_hdlr))
+        with self.assertRaises(MP4StreamInfoError):
+            _build_info(_video_trak(), bad_trak)
+
+    def test_sound_trak_with_truncated_stsd_raises_stream_info_error(self):
+        # a malformed audio sample entry must surface as MP4StreamInfoError,
+        # not as a raw AtomError/ASEntryError
+        bad_stsd = Atom.render(
+            b"stsd", b"\x00\x00\x00\x00" + struct.pack(">I", 1) + b"\x00" * 4)
+        stbl = Atom.render(b"stbl", bad_stsd)
+        minf = Atom.render(b"minf", stbl)
+        bad_trak = Atom.render(
+            b"trak", Atom.render(b"mdia", _mdhd() + _hdlr(b"soun") + minf))
+        with self.assertRaises(MP4StreamInfoError):
+            _build_info(bad_trak)
+
+    def test_sound_trak_without_stsd_keeps_defaults(self):
+        # missing stsd is tolerated: duration is known, audio attributes
+        # stay at their zero defaults
+        trak = Atom.render(
+            b"trak",
+            Atom.render(
+                b"mdia", _mdhd() + _hdlr(b"soun") +
+                Atom.render(b"minf", b"")))
+        info = _build_info(trak)
+        self.assertEqual(info.channels, 0)
+        self.assertEqual(info.sample_rate, 0)
+        self.assertEqual(info.bitrate, 0)
+        self.assertEqual(info.length, 1.0)
 
 
 class TMP4Tags(TestCase):

@@ -1016,12 +1016,30 @@ class MP4Info(StreamInfo):
 
     MPEG-4 stream information.
 
+    Stream selection contract for containers with multiple tracks:
+
+    * only audio tracks (handler type ``'soun'``) are inspected; video and
+      other tracks are never used as a source of audio attributes, so video
+      frame dimensions can never surface as sample rate or channel counts
+    * in audio/video mixed containers the audio track is selected
+      regardless of whether it is stored before or after the video track
+    * with multiple audio tracks the first audio track is selected
+    * containers without any audio track (e.g. pure video files) keep the
+      audio attributes at their zero defaults and only expose the
+      container duration parsed from ``mvhd``
+    * malformed track blocks (missing or truncated ``hdlr``/``mdhd``) raise
+      `MP4StreamInfoError` instead of low level exceptions
+
     Attributes:
-        bitrate (`int`): bitrate in bits per second, as an int
+        bitrate (`int`): bitrate in bits per second, as an int.
+            ``0`` means no audio track was present or the bitrate is unknown
         length (`float`): file length in seconds, as a float
-        channels (`int`): number of audio channels
-        sample_rate (`int`): audio sampling rate in Hz
-        bits_per_sample (`int`): bits per sample
+        channels (`int`): number of audio channels; ``0`` for containers
+            without an audio track
+        sample_rate (`int`): audio sampling rate in Hz; ``0`` for
+            containers without an audio track
+        bits_per_sample (`int`): bits per sample; ``0`` for containers
+            without an audio track
         codec (`mutagen.text`):
             * if starting with ``"mp4a"`` uses an mp4a audio codec
               (see the codec parameter in rfc6381 for details e.g.
@@ -1030,6 +1048,7 @@ class MP4Info(StreamInfo):
               http://www.mp4ra.org/codecs.html
 
             e.g. ``"mp4a"``, ``"alac"``, ``"mp4a.40.2"``, ``"ac-3"`` etc.
+            Empty for containers without an audio track.
         codec_description (`mutagen.text`):
             Name of the codec used (ALAC, AAC LC, AC-3...). Values might
             change in the future, use for display purposes only.
@@ -1047,6 +1066,67 @@ class MP4Info(StreamInfo):
         if args or kwargs:
             self.load(*args, **kwargs)
 
+    # The handler_type field of a 'hdlr' atom is located at byte offset 8
+    # and is four bytes long (ISO/IEC 14496-12, 8.4.3). Any shorter payload
+    # cannot carry a valid handler type.
+    _HANDLER_TYPE_OFFSET = 8
+    _HANDLER_TYPE_SIZE = 4
+    _SOUND_HANDLER_TYPE = b"soun"
+
+    @classmethod
+    def _find_audio_trak(cls, moov, fileobj):
+        """Return the first audio ('soun') track atom, independent of where
+        video or other tracks appear.
+
+        Container contract:
+
+        * mixed audio/video containers always resolve to an audio track,
+          regardless of the relative order of video and audio tracks
+        * with multiple audio tracks the first one wins, deterministically
+        * video-only or otherwise non-audio containers are not treated as
+          audio: they fall through without a result
+        * malformed tracks (missing or truncated 'hdlr'/'mdia' atoms) raise
+          MP4StreamInfoError instead of leaking low level exceptions
+
+        Raises MP4StreamInfoError and returns None when no audio track
+        exists.
+        """
+
+        for trak in moov.findall(b"trak"):
+            try:
+                hdlr = trak[b"mdia", b"hdlr"]
+            except KeyError as e:
+                raise MP4StreamInfoError(
+                    "track has no media handler (mdia.hdlr): %s" % e)
+
+            ok, data = hdlr.read(fileobj)
+            if not ok:
+                raise MP4StreamInfoError("Not enough data")
+
+            end = cls._HANDLER_TYPE_OFFSET + cls._HANDLER_TYPE_SIZE
+            if len(data) < end:
+                raise MP4StreamInfoError(
+                    "truncated hdlr atom: handler_type needs %d bytes, "
+                    "got %d" % (end, len(data)))
+
+            if data[cls._HANDLER_TYPE_OFFSET:end] != \
+                    cls._SOUND_HANDLER_TYPE:
+                # video ('vide'), hint ('hint'), meta ('meta') etc. are
+                # never a source of audio attributes
+                continue
+
+            try:
+                # make sure the selected audio track actually carries the
+                # media header needed for its duration
+                trak[b"mdia", b"mdhd"]
+            except KeyError as e:
+                raise MP4StreamInfoError(
+                    "audio track has no media header (mdia.mdhd): %s" % e)
+
+            return trak
+
+        return None
+
     @convert_error(IOError, MP4StreamInfoError)
     def load(self, atoms, fileobj):
         try:
@@ -1054,22 +1134,17 @@ class MP4Info(StreamInfo):
         except KeyError:
             raise MP4StreamInfoError("not a MP4 file")
 
-        for trak in moov.findall(b"trak"):
-            hdlr = trak[b"mdia", b"hdlr"]
-            ok, data = hdlr.read(fileobj)
-            if not ok:
-                raise MP4StreamInfoError("Not enough data")
-            if data[8:12] == b"soun":
-                break
-        else:
+        trak = self._find_audio_trak(moov, fileobj)
+        if trak is None:
+            # No audio track (e.g. a pure video file). Fall back to the
+            # overall container duration from mvhd; without an mvhd there is
+            # no track information at all.
             try:
-                # No track info. Fall back to reading the overall length
-                # from mvhd.
-                mvhd = moov[b'mvhd',]
-                self._parse_mvhd(mvhd, fileobj)
-                return
+                mvhd = moov[b'mvhd', ]
             except KeyError:
                 raise MP4NoTrackError("track has no audio data")
+            self._parse_mvhd(mvhd, fileobj)
+            return
 
         mdhd = trak[b"mdia", b"mdhd"]
         ok, data = mdhd.read(fileobj)
@@ -1178,8 +1253,10 @@ class MP4(FileType):
 
     An MPEG-4 audio file, probably containing AAC.
 
-    If more than one track is present in the file, the first is used.
-    Only audio ('soun') tracks will be read.
+    If more than one track is present in the file, the first audio
+    ('soun') track is used; track ordering relative to video tracks does
+    not affect the result. Only audio ('soun') tracks are read, so pure
+    video files never report fabricated audio attributes.
 
     Arguments:
         filething (filething)
